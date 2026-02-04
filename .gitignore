@@ -212,3 +212,10 @@ __marimo__/
 
 # Ignore the DATA directory
 DATA/
+
+# Pipeline output directories
+data/
+output/
+
+# Ignore the scratch directory
+scratch/
