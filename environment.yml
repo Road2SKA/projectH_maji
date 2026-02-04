@@ -1,0 +1,26 @@
+name: maji
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+
+dependencies:
+  # Python version
+  - python=3.10
+
+  # Progress bars
+  - tqdm>=4.65
+  
+  # Core scientific stack
+  - numpy>=1.24
+  - pandas>=2.0
+  - matplotlib>=3.7
+  - pytorch>=2.0
+  - torchvision>=0.15
+  - jupyterlab>=4.0
+  - ipywidgets>=8.0
+
+  # Geospatial / raster I/O
+  - rasterio>=1.3
+  - libgdal-jp2openjpeg
+
