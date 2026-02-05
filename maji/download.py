@@ -1,17 +1,21 @@
 """Download Sentinel-2 bands from CDSE S3 and produce GeoTIFFs.
 
-Reads individual JP2 band files directly from the CDSE eodata bucket
-via rasterio's /vsis3/ driver, resamples 20m bands to 10m, and
-stacks into a single multi-band Cloud-Optimized GeoTIFF.
+Downloads individual JP2 band files from the CDSE eodata bucket
+via boto3, resamples 20m bands to 10m, and stacks into a single
+multi-band Cloud-Optimized GeoTIFF.
 """
 
 from __future__ import annotations
 
 import logging
+import os
+import tempfile
 import time
 import warnings
 from pathlib import Path
+from urllib.parse import urlparse
 
+import boto3
 import numpy as np
 import pandas as pd
 import rasterio
@@ -53,6 +57,9 @@ def create_s3_session(
 ) -> AWSSession:
     """Create a rasterio AWSSession configured for CDSE S3.
 
+    Also sets environment variables for boto3 access to the same
+    endpoint.
+
     Parameters
     ----------
     access_key : str
@@ -66,15 +73,23 @@ def create_s3_session(
     Returns
     -------
     rasterio.session.AWSSession
-        Configured session that can be passed to
-        :func:`rasterio.Env` or directly to download helpers.
+        Configured session that can be passed to download helpers.
 
     Notes
     -----
     The CDSE eodata bucket uses an S3-compatible API but is **not**
     hosted on AWS.  The session sets ``aws_unsigned=False`` so that
     signed requests are sent using the provided credentials.
+
+    Environment variables ``AWS_ACCESS_KEY_ID``,
+    ``AWS_SECRET_ACCESS_KEY``, and ``AWS_S3_ENDPOINT`` are set for
+    boto3 compatibility.
     """
+    # Set environment variables for boto3 access
+    os.environ["AWS_ACCESS_KEY_ID"] = access_key
+    os.environ["AWS_SECRET_ACCESS_KEY"] = secret_key
+    os.environ["AWS_S3_ENDPOINT"] = endpoint_url
+
     return AWSSession(
         aws_access_key_id=access_key,
         aws_secret_access_key=secret_key,
@@ -83,13 +98,38 @@ def create_s3_session(
     )
 
 
+def _parse_s3_url(href: str) -> tuple[str, str]:
+    """Parse an S3 URL into bucket and key.
+
+    Parameters
+    ----------
+    href : str
+        S3 URL in the form ``s3://bucket/key/path``.
+
+    Returns
+    -------
+    bucket : str
+        The bucket name.
+    key : str
+        The object key (path within the bucket).
+    """
+    parsed = urlparse(href)
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    return bucket, key
+
+
 def _read_band_with_retry(
     href: str,
     target_shape: tuple[int, int],
     resampling: Resampling,
+    s3_client,
     max_retries: int = MAX_RETRIES,
 ) -> tuple[np.ndarray, dict]:
     """Read a single band from S3 with retry on transient errors.
+
+    Downloads the file via boto3 to a temporary file, then opens it
+    locally with rasterio.
 
     Parameters
     ----------
@@ -101,6 +141,8 @@ def _read_band_with_retry(
     resampling : rasterio.enums.Resampling
         Resampling method (``bilinear`` for reflectance bands,
         ``nearest`` for the SCL classification band).
+    s3_client : botocore.client.S3
+        Boto3 S3 client configured for CDSE.
     max_retries : int, optional
         Number of retry attempts (default: :data:`MAX_RETRIES`).
 
@@ -116,37 +158,41 @@ def _read_band_with_retry(
     Raises
     ------
     RuntimeError
-        If all retry attempts are exhausted.  The original
-        :class:`rasterio.errors.RasterioIOError` is chained as the
-        cause.
+        If all retry attempts are exhausted.  The original exception
+        is chained as the cause.
     """
+    bucket, key = _parse_s3_url(href)
     last_error: Exception | None = None
+
     for attempt in range(max_retries):
         try:
-            with rasterio.open(href) as src:
-                native_shape = (src.height, src.width)
-                meta = {
-                    "crs": src.crs,
-                    "transform": src.transform,
-                    "native_shape": native_shape,
-                }
+            with tempfile.NamedTemporaryFile(suffix=".jp2", delete=True) as tmp:
+                s3_client.download_file(bucket, key, tmp.name)
 
-                if native_shape == target_shape:
-                    data = src.read(1)
-                else:
-                    data = src.read(
-                        1,
-                        out_shape=target_shape,
-                        resampling=resampling,
-                    )
+                with rasterio.open(tmp.name) as src:
+                    native_shape = (src.height, src.width)
+                    meta = {
+                        "crs": src.crs,
+                        "transform": src.transform,
+                        "native_shape": native_shape,
+                    }
 
-                return data, meta
+                    if native_shape == target_shape:
+                        data = src.read(1)
+                    else:
+                        data = src.read(
+                            1,
+                            out_shape=target_shape,
+                            resampling=resampling,
+                        )
 
-        except rasterio.errors.RasterioIOError as e:
+                    return data, meta
+
+        except Exception as e:
             last_error = e
             wait = RETRY_BACKOFF * (2 ** attempt)
             logger.warning(
-                "S3 read failed for %s (attempt %d/%d), retrying in %.1fs: %s",
+                "S3 download failed for %s (attempt %d/%d), retrying in %.1fs: %s",
                 href, attempt + 1, max_retries, wait, e,
             )
             time.sleep(wait)
@@ -227,83 +273,85 @@ def download_tile(
         logger.info("Skipping %s (already exists)", out_path)
         return out_path
 
+    # Create boto3 S3 client using credentials from environment
+    # (set by create_s3_session)
+    endpoint_url = os.environ.get(
+        "AWS_S3_ENDPOINT", "https://eodata.dataspace.copernicus.eu"
+    )
+    s3_client = boto3.client("s3", endpoint_url=endpoint_url)
+
     target_shape = (TARGET_HEIGHT, TARGET_WIDTH)
     reference_crs = None
     reference_transform = None
 
-    # First pass: read all bands inside rasterio.Env, write band-by-band
-    with rasterio.Env(
-        session=session,
-        AWS_VIRTUAL_HOSTING=False,
-        GDAL_DISABLE_READDIR_ON_OPEN="TRUE",
-        CPL_VSIL_CURL_ALLOWED_EXTENSIONS=".jp2",
-    ):
-        # Read first 10m band to get CRS/transform for the output file
-        for band_name in bands:
-            if BAND_RESOLUTION.get(band_name) == 10:
-                href = scene_assets.get(band_name)
-                if href is None:
-                    continue
-                _, meta = _read_band_with_retry(
-                    href, target_shape, Resampling.bilinear,
-                )
-                if meta["native_shape"] == target_shape:
-                    reference_crs = meta["crs"]
-                    reference_transform = meta["transform"]
-                    break
-
-        # Fallback: derive 10m transform from a 20m band
-        if reference_crs is None:
-            first_href = scene_assets[bands[0]]
+    # Read first 10m band to get CRS/transform for the output file
+    for band_name in bands:
+        if BAND_RESOLUTION.get(band_name) == 10:
+            href = scene_assets.get(band_name)
+            if href is None:
+                continue
             _, meta = _read_band_with_retry(
-                first_href, target_shape, Resampling.bilinear,
+                href, target_shape, Resampling.bilinear, s3_client,
             )
-            reference_crs = meta["crs"]
-            t = meta["transform"]
-            native_h, native_w = meta["native_shape"]
-            scale = native_h / TARGET_HEIGHT  # e.g. 0.5 for 20m→10m
-            reference_transform = Affine(
-                t.a * scale, t.b, t.c,
-                t.d, t.e * scale, t.f,
-            )
+            if meta["native_shape"] == target_shape:
+                reference_crs = meta["crs"]
+                reference_transform = meta["transform"]
+                break
 
-        profile = {
-            "driver": "GTiff",
-            "dtype": "uint16",
-            "width": TARGET_WIDTH,
-            "height": TARGET_HEIGHT,
-            "count": len(bands),
-            "crs": reference_crs,
-            "transform": reference_transform,
-            "compress": "deflate",
-            "tiled": True,
-            "blockxsize": 512,
-            "blockysize": 512,
-        }
+    # Fallback: derive 10m transform from a 20m band
+    if reference_crs is None:
+        first_href = scene_assets[bands[0]]
+        _, meta = _read_band_with_retry(
+            first_href, target_shape, Resampling.bilinear, s3_client,
+        )
+        reference_crs = meta["crs"]
+        t = meta["transform"]
+        native_h, native_w = meta["native_shape"]
+        scale = native_h / TARGET_HEIGHT  # e.g. 0.5 for 20m→10m
+        reference_transform = Affine(
+            t.a * scale, t.b, t.c,
+            t.d, t.e * scale, t.f,
+        )
 
-        with rasterio.open(out_path, "w", **profile) as dst:
-            for band_idx, band_name in enumerate(bands, start=1):
-                href = scene_assets.get(band_name)
-                if href is None:
-                    raise KeyError(
-                        f"No S3 href found for band {band_name} in scene assets"
-                    )
+    profile = {
+        "driver": "GTiff",
+        "dtype": "uint16",
+        "width": TARGET_WIDTH,
+        "height": TARGET_HEIGHT,
+        "count": len(bands),
+        "crs": reference_crs,
+        "transform": reference_transform,
+        "compress": "deflate",
+        "tiled": True,
+        "blockxsize": 512,
+        "blockysize": 512,
+    }
 
-                resampling = (
-                    Resampling.nearest if band_name == "SCL"
-                    else Resampling.bilinear
+    with rasterio.open(out_path, "w", **profile) as dst:
+        for band_idx, band_name in enumerate(bands, start=1):
+            href = scene_assets.get(band_name)
+            if href is None:
+                raise KeyError(
+                    f"No S3 href found for band {band_name} in scene assets"
                 )
 
-                logger.info(
-                    "Reading %s (%dm) → %s",
-                    band_name,
-                    BAND_RESOLUTION.get(band_name, 0),
-                    "native" if BAND_RESOLUTION.get(band_name) == 10 else "resampled to 10m",
-                )
+            resampling = (
+                Resampling.nearest if band_name == "SCL"
+                else Resampling.bilinear
+            )
 
-                data, _ = _read_band_with_retry(href, target_shape, resampling)
-                dst.write(data, band_idx)
-                dst.set_band_description(band_idx, band_name)
+            logger.info(
+                "Reading %s (%dm) → %s",
+                band_name,
+                BAND_RESOLUTION.get(band_name, 0),
+                "native" if BAND_RESOLUTION.get(band_name) == 10 else "resampled to 10m",
+            )
+
+            data, _ = _read_band_with_retry(
+                href, target_shape, resampling, s3_client,
+            )
+            dst.write(data, band_idx)
+            dst.set_band_description(band_idx, band_name)
 
     size_mb = out_path.stat().st_size / 1e6
     logger.info("Saved %s (%d bands, %.1f MB)", out_path, len(bands), size_mb)

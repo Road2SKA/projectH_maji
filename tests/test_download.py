@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from unittest.mock import MagicMock, patch, call
 
@@ -18,6 +19,7 @@ from maji.download import (
     BAND_RESOLUTION,
     TARGET_HEIGHT,
     TARGET_WIDTH,
+    _parse_s3_url,
     _read_band_with_retry,
     create_s3_session,
     download_tile,
@@ -52,6 +54,33 @@ class TestCreateS3Session:
             endpoint_url="https://custom.example.com",
             aws_unsigned=False,
         )
+
+    @patch("maji.download.AWSSession")
+    def test_sets_environment_variables(self, mock_aws_session):
+        """Should set environment variables for boto3 access."""
+        create_s3_session("mykey", "mysecret", endpoint_url="https://test.example.com")
+        assert os.environ["AWS_ACCESS_KEY_ID"] == "mykey"
+        assert os.environ["AWS_SECRET_ACCESS_KEY"] == "mysecret"
+        assert os.environ["AWS_S3_ENDPOINT"] == "https://test.example.com"
+
+
+# --- _parse_s3_url ----------------------------------------------------------
+
+
+class TestParseS3Url:
+    """Tests for :func:`maji.download._parse_s3_url`."""
+
+    def test_parses_standard_url(self):
+        """Should parse bucket and key from standard S3 URL."""
+        bucket, key = _parse_s3_url("s3://eodata/Sentinel-2/L2A/path/to/file.jp2")
+        assert bucket == "eodata"
+        assert key == "Sentinel-2/L2A/path/to/file.jp2"
+
+    def test_handles_simple_key(self):
+        """Should handle single-component key."""
+        bucket, key = _parse_s3_url("s3://mybucket/file.txt")
+        assert bucket == "mybucket"
+        assert key == "file.txt"
 
 
 # --- _read_band_with_retry -----------------------------------------------
@@ -100,15 +129,29 @@ class TestReadBandWithRetry:
     """Tests for :func:`maji.download._read_band_with_retry`."""
 
     @patch("maji.download.rasterio.open")
-    def test_10m_band_no_resampling(self, mock_open):
+    @patch("maji.download.tempfile.NamedTemporaryFile")
+    def test_10m_band_no_resampling(self, mock_tempfile, mock_open):
         """10m band at target shape — should read without resampling."""
         target = (TARGET_HEIGHT, TARGET_WIDTH)
+
+        # Mock temp file
+        mock_tmp = MagicMock()
+        mock_tmp.name = "/tmp/test.jp2"
+        mock_tempfile.return_value.__enter__.return_value = mock_tmp
+
         mock_open.return_value = _mock_rasterio_open(TARGET_HEIGHT, TARGET_WIDTH)
+
+        mock_s3_client = MagicMock()
 
         data, meta = _read_band_with_retry(
             "s3://eodata/.../B03_10m.jp2", target, Resampling.bilinear,
+            s3_client=mock_s3_client,
         )
 
+        # Verify S3 download was called
+        mock_s3_client.download_file.assert_called_once_with(
+            "eodata", ".../B03_10m.jp2", "/tmp/test.jp2"
+        )
         assert data.shape == target
         assert meta["native_shape"] == target
         # read() called with just band index (no out_shape)
@@ -116,9 +159,16 @@ class TestReadBandWithRetry:
         mock_ds.read.assert_called_once_with(1)
 
     @patch("maji.download.rasterio.open")
-    def test_20m_band_resampled(self, mock_open):
+    @patch("maji.download.tempfile.NamedTemporaryFile")
+    def test_20m_band_resampled(self, mock_tempfile, mock_open):
         """20m band (5490×5490) — should be resampled to target shape."""
         target = (TARGET_HEIGHT, TARGET_WIDTH)
+
+        # Mock temp file
+        mock_tmp = MagicMock()
+        mock_tmp.name = "/tmp/test.jp2"
+        mock_tempfile.return_value.__enter__.return_value = mock_tmp
+
         resampled_data = np.ones(target, dtype=np.uint16)
         mock_ds = MagicMock()
         mock_ds.height = 5490
@@ -132,8 +182,11 @@ class TestReadBandWithRetry:
         ctx.__exit__ = MagicMock(return_value=False)
         mock_open.return_value = ctx
 
+        mock_s3_client = MagicMock()
+
         data, meta = _read_band_with_retry(
             "s3://eodata/.../B8A_20m.jp2", target, Resampling.bilinear,
+            s3_client=mock_s3_client,
         )
 
         mock_ds.read.assert_called_once_with(
@@ -142,9 +195,16 @@ class TestReadBandWithRetry:
         assert meta["native_shape"] == (5490, 5490)
 
     @patch("maji.download.rasterio.open")
-    def test_scl_uses_nearest(self, mock_open):
+    @patch("maji.download.tempfile.NamedTemporaryFile")
+    def test_scl_uses_nearest(self, mock_tempfile, mock_open):
         """SCL band should use nearest-neighbor resampling."""
         target = (TARGET_HEIGHT, TARGET_WIDTH)
+
+        # Mock temp file
+        mock_tmp = MagicMock()
+        mock_tmp.name = "/tmp/test.jp2"
+        mock_tempfile.return_value.__enter__.return_value = mock_tmp
+
         mock_ds = MagicMock()
         mock_ds.height = 5490
         mock_ds.width = 5490
@@ -157,8 +217,11 @@ class TestReadBandWithRetry:
         ctx.__exit__ = MagicMock(return_value=False)
         mock_open.return_value = ctx
 
+        mock_s3_client = MagicMock()
+
         _read_band_with_retry(
             "s3://eodata/.../SCL_20m.jp2", target, Resampling.nearest,
+            s3_client=mock_s3_client,
         )
 
         mock_ds.read.assert_called_once_with(
@@ -167,9 +230,15 @@ class TestReadBandWithRetry:
 
     @patch("maji.download.time.sleep")
     @patch("maji.download.rasterio.open")
-    def test_retry_on_transient_error(self, mock_open, mock_sleep):
+    @patch("maji.download.tempfile.NamedTemporaryFile")
+    def test_retry_on_transient_error(self, mock_tempfile, mock_open, mock_sleep):
         """Should retry and succeed on the second attempt."""
         target = (TARGET_HEIGHT, TARGET_WIDTH)
+
+        # Mock temp file
+        mock_tmp = MagicMock()
+        mock_tmp.name = "/tmp/test.jp2"
+        mock_tempfile.return_value.__enter__.return_value = mock_tmp
 
         # First call fails, second succeeds
         good_ctx = _mock_rasterio_open(TARGET_HEIGHT, TARGET_WIDTH)
@@ -178,8 +247,11 @@ class TestReadBandWithRetry:
             good_ctx,
         ]
 
+        mock_s3_client = MagicMock()
+
         data, meta = _read_band_with_retry(
             "s3://eodata/.../B03_10m.jp2", target, Resampling.bilinear,
+            s3_client=mock_s3_client,
         )
 
         assert mock_open.call_count == 2
@@ -187,14 +259,24 @@ class TestReadBandWithRetry:
 
     @patch("maji.download.time.sleep")
     @patch("maji.download.rasterio.open")
-    def test_exhausted_retries(self, mock_open, mock_sleep):
+    @patch("maji.download.tempfile.NamedTemporaryFile")
+    def test_exhausted_retries(self, mock_tempfile, mock_open, mock_sleep):
         """Should raise RuntimeError after all retries fail."""
         target = (TARGET_HEIGHT, TARGET_WIDTH)
+
+        # Mock temp file
+        mock_tmp = MagicMock()
+        mock_tmp.name = "/tmp/test.jp2"
+        mock_tempfile.return_value.__enter__.return_value = mock_tmp
+
         mock_open.side_effect = rasterio.errors.RasterioIOError("timeout")
+
+        mock_s3_client = MagicMock()
 
         with pytest.raises(RuntimeError, match="Failed to read"):
             _read_band_with_retry(
                 "s3://eodata/.../B03_10m.jp2", target, Resampling.bilinear,
+                s3_client=mock_s3_client,
                 max_retries=3,
             )
 
@@ -210,10 +292,10 @@ class TestDownloadTile:
     def _make_assets(self):
         return {band: f"s3://eodata/.../{band}.jp2" for band in ALL_BANDS}
 
+    @patch("maji.download.boto3.client")
     @patch("maji.download._read_band_with_retry")
-    @patch("maji.download.rasterio.Env")
     @patch("maji.download.rasterio.open")
-    def test_writes_geotiff(self, mock_rio_open, mock_env, mock_read, tmp_path):
+    def test_writes_geotiff(self, mock_rio_open, mock_read, mock_boto_client, tmp_path):
         """download_tile should create a multi-band GeoTIFF."""
         crs = CRS.from_epsg(32637)
         transform = Affine(10.0, 0, 500000, 0, -10.0, 10000000)
@@ -222,9 +304,6 @@ class TestDownloadTile:
             np.ones((TARGET_HEIGHT, TARGET_WIDTH), dtype=np.uint16),
             {"crs": crs, "transform": transform, "native_shape": (TARGET_HEIGHT, TARGET_WIDTH)},
         )
-
-        mock_env.return_value.__enter__ = MagicMock(return_value=None)
-        mock_env.return_value.__exit__ = MagicMock(return_value=False)
 
         # Mock the writer and make __exit__ create the file on disk
         # (simulating what rasterio does when closing)
@@ -253,6 +332,8 @@ class TestDownloadTile:
         )
 
         assert result == out_file
+        # boto3.client should be called to create S3 client
+        mock_boto_client.assert_called_once()
         # Should have read 7 bands (first 10m band for ref, then all 7 for writing)
         # Minimum: 1 ref read + 7 band reads = 8
         assert mock_read.call_count >= len(ALL_BANDS)
@@ -260,10 +341,10 @@ class TestDownloadTile:
         assert mock_writer.write.call_count == len(ALL_BANDS)
         assert mock_writer.set_band_description.call_count == len(ALL_BANDS)
 
+    @patch("maji.download.boto3.client")
     @patch("maji.download._read_band_with_retry")
-    @patch("maji.download.rasterio.Env")
     @patch("maji.download.rasterio.open")
-    def test_skip_existing(self, mock_rio_open, mock_env, mock_read, tmp_path):
+    def test_skip_existing(self, mock_rio_open, mock_read, mock_boto_client, tmp_path):
         """Should skip download when file already exists and overwrite=False."""
         tile_dir = tmp_path / "37MFT"
         tile_dir.mkdir()
@@ -282,11 +363,13 @@ class TestDownloadTile:
 
         assert result == existing
         mock_read.assert_not_called()
+        # boto3 client should not be created when skipping
+        mock_boto_client.assert_not_called()
 
+    @patch("maji.download.boto3.client")
     @patch("maji.download._read_band_with_retry")
-    @patch("maji.download.rasterio.Env")
     @patch("maji.download.rasterio.open")
-    def test_overwrite_existing(self, mock_rio_open, mock_env, mock_read, tmp_path):
+    def test_overwrite_existing(self, mock_rio_open, mock_read, mock_boto_client, tmp_path):
         """Should re-download when overwrite=True even if file exists."""
         tile_dir = tmp_path / "37MFT"
         tile_dir.mkdir()
@@ -299,9 +382,6 @@ class TestDownloadTile:
             np.ones((TARGET_HEIGHT, TARGET_WIDTH), dtype=np.uint16),
             {"crs": crs, "transform": transform, "native_shape": (TARGET_HEIGHT, TARGET_WIDTH)},
         )
-
-        mock_env.return_value.__enter__ = MagicMock(return_value=None)
-        mock_env.return_value.__exit__ = MagicMock(return_value=False)
 
         mock_writer = MagicMock()
         mock_rio_open.return_value.__enter__ = MagicMock(return_value=mock_writer)
