@@ -126,6 +126,7 @@ def search_scenes(
     end: str | datetime,
     max_cloud: float = 40.0,
     max_items: int = 100,
+    verbose: bool = False,
 ) -> gpd.GeoDataFrame:
     """Search CDSE STAC for Sentinel-2 L2A scenes.
 
@@ -145,6 +146,8 @@ def search_scenes(
         Maximum cloud cover percentage, 0–100 (default 40).
     max_items : int, optional
         Maximum number of STAC items to return (default 100).
+    verbose : bool, optional
+        If True, print search parameters and results summary (default False).
 
     Returns
     -------
@@ -180,12 +183,29 @@ def search_scenes(
     >>> df.columns.tolist()
     ['scene_id', 'mgrs_tile', 'datetime', 'cloud_cover', 'geometry', 'assets']
     """
+    # Track whether defaults are used (before converting datetimes)
+    max_cloud_is_default = max_cloud == 40.0
+    max_items_is_default = max_items == 100
+
     if isinstance(start, datetime):
         start = start.strftime("%Y-%m-%dT%H:%M:%SZ")
     if isinstance(end, datetime):
         end = end.strftime("%Y-%m-%dT%H:%M:%SZ")
 
+    if verbose:
+        print(f"Searching CDSE STAC ({COLLECTION})")
+        print(f"  endpoint:  {STAC_URL}")
+
     catalog = Client.open(STAC_URL)
+
+    if verbose:
+        print(f"  connected: {catalog.title or 'OK'}")
+        print(f"  bbox:      {bbox}")
+        print(f"  dates:     {start} to {end}")
+        cloud_suffix = " (default)" if max_cloud_is_default else ""
+        print(f"  max_cloud: {max_cloud}%{cloud_suffix}")
+        items_suffix = " (default)" if max_items_is_default else ""
+        print(f"  max_items: {max_items}{items_suffix}")
     search = catalog.search(
         collections=[COLLECTION],
         bbox=list(bbox),
@@ -196,13 +216,17 @@ def search_scenes(
 
     items = search.item_collection()
     logger.info("STAC search returned %d items", len(items))
+    if verbose:
+        print(f"Found {len(items)} items from catalog")
 
     rows: list[dict] = []
+    skipped_count = 0
     for item in items:
         props = item.properties
         mgrs_tile = _extract_mgrs_tile(props)
         if not mgrs_tile:
             logger.warning("Could not extract MGRS tile from item %s", item.id)
+            skipped_count += 1
             continue
 
         band_assets = _extract_band_assets(item.assets)
@@ -211,6 +235,7 @@ def search_scenes(
             logger.warning(
                 "Item %s missing bands: %s — skipping", item.id, missing
             )
+            skipped_count += 1
             continue
 
         rows.append(
@@ -223,6 +248,18 @@ def search_scenes(
                 "assets": band_assets,
             }
         )
+
+    if verbose:
+        if rows:
+            tile_count = len({r["mgrs_tile"] for r in rows})
+            print(f"  → {len(rows)} valid scenes across {tile_count} MGRS tiles")
+            if skipped_count > 0:
+                print(f"  ⚠ {skipped_count} items skipped (missing bands or MGRS tile)")
+        else:
+            print("  ⚠ No scenes match the search criteria. Try:")
+            print("    - Expanding the date range")
+            print("    - Increasing max_cloud threshold")
+            print("    - Checking the bbox coordinates")
 
     if not rows:
         return gpd.GeoDataFrame(
@@ -239,6 +276,7 @@ def search_scenes(
 def select_best_scenes(
     scenes: gpd.GeoDataFrame,
     strategy: str = "least_cloudy",
+    verbose: bool = False,
 ) -> gpd.GeoDataFrame:
     """For each MGRS tile, select the best scene.
 
@@ -254,6 +292,8 @@ def select_best_scenes(
         * ``"most_recent"`` — scene with the latest ``datetime`` per
           tile.
         * ``"all"`` — no filtering; return every scene.
+    verbose : bool, optional
+        If True, print selection summary (default False).
 
     Returns
     -------
@@ -272,7 +312,21 @@ def select_best_scenes(
     >>> best["mgrs_tile"].is_unique
     True
     """
+    strategy_is_default = strategy == "least_cloudy"
+
+    if verbose:
+        print("Selecting best scene per tile")
+        strategy_suffix = " (default)" if strategy_is_default else ""
+        print(f"  strategy: {strategy}{strategy_suffix}")
+        if len(scenes) == 0:
+            print("  ⚠ No scenes to select from — input is empty")
+        else:
+            tile_count = scenes["mgrs_tile"].nunique()
+            print(f"  input:    {len(scenes)} scenes across {tile_count} tiles")
+
     if strategy == "all":
+        if verbose and len(scenes) > 0:
+            print(f"  output:   {len(scenes)} scenes (all)")
         return scenes
 
     if strategy == "least_cloudy":
@@ -282,4 +336,7 @@ def select_best_scenes(
     else:
         raise ValueError(f"Unknown strategy: {strategy!r}")
 
-    return scenes.loc[idx].reset_index(drop=True)
+    result = scenes.loc[idx].reset_index(drop=True)
+    if verbose and len(scenes) > 0:
+        print(f"  output:   {len(result)} scenes (one per tile)")
+    return result
