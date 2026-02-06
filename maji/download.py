@@ -23,24 +23,27 @@ from rasterio.enums import Resampling
 from rasterio.session import AWSSession
 from rasterio.transform import Affine
 
+from maji.constants import (
+    BAND_RESOLUTION,
+    DEFAULT_DOWNLOAD_BANDS,
+    DEFAULT_MODEL_BANDS,
+    SCL_BAND,
+    TILE_HEIGHT_10M,
+    TILE_WIDTH_10M,
+)
+
 logger = logging.getLogger(__name__)
 
-# --- Band configuration -----------------------------------------------
+# --- Band configuration (imported from constants) ---------------------
 
-MODEL_BANDS = ["B03", "B04", "B08", "B8A", "B11", "B12"]
-CLOUD_BAND = "SCL"
-ALL_BANDS = MODEL_BANDS + [CLOUD_BAND]
-
-BAND_RESOLUTION: dict[str, int] = {
-    "B02": 10, "B03": 10, "B04": 10, "B08": 10,
-    "B05": 20, "B06": 20, "B07": 20, "B8A": 20,
-    "B11": 20, "B12": 20, "SCL": 20,
-    "B01": 60, "B09": 60,
-}
+# Backward-compatible aliases
+MODEL_BANDS = DEFAULT_MODEL_BANDS
+CLOUD_BAND = SCL_BAND
+ALL_BANDS = DEFAULT_DOWNLOAD_BANDS
 
 # Full MGRS tile dimensions at 10m
-TARGET_HEIGHT = 10980
-TARGET_WIDTH = 10980
+TARGET_HEIGHT = TILE_HEIGHT_10M
+TARGET_WIDTH = TILE_WIDTH_10M
 
 # Retry configuration for transient S3 errors
 MAX_RETRIES = 3

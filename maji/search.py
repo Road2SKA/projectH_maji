@@ -15,13 +15,16 @@ import pandas as pd
 from pystac_client import Client
 from shapely.geometry import shape
 
+from maji.constants import DEFAULT_DOWNLOAD_BANDS
+
 logger = logging.getLogger(__name__)
 
 STAC_URL = "https://stac.dataspace.copernicus.eu/v1/"
 COLLECTION = "sentinel-2-l2a"
 
 # Bands we care about (model bands + cloud mask)
-BANDS_OF_INTEREST = ["B03", "B04", "B08", "B8A", "B11", "B12", "SCL"]
+# Imported from constants, with backward-compatible alias
+BANDS_OF_INTEREST = DEFAULT_DOWNLOAD_BANDS
 
 
 def _extract_mgrs_tile(properties: dict) -> str:
