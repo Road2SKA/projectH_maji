@@ -3,6 +3,9 @@ __pycache__/
 *.py[codz]
 *$py.class
 
+# Apple specific files
+*.DS_Store
+
 # C extensions
 *.so
 
@@ -209,3 +212,10 @@ __marimo__/
 
 # Ignore the DATA directory
 DATA/
+
+# Pipeline output directories
+data/
+output/
+
+# Ignore the scratch directory
+scratch/
